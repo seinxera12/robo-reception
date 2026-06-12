@@ -1,0 +1,80 @@
+
+services:
+    
+  postgres:
+    image: postgres:16-alpine
+    container_name: reception-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reception
+      POSTGRES_PASSWORD: reception
+      POSTGRES_DB: reception
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reception"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: reception-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: reception-ntfy
+    restart: unless-stopped
+    command: serve
+    ports:
+      - "8081:80"
+    volumes:
+      - ntfy_cache:/var/cache/ntfy
+      - ntfy_data:/etc/ntfy
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: reception-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+  
+  reception-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://reception:reception@postgres:5432/reception
+      REDIS_URL: redis://redis:6379/0
+      NTFY_HOST: http://ntfy:8081
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+volumes:
+  postgres_data:
+  redis_data:
+  ntfy_cache:
+  ntfy_data:
+  ollama_data:
+
+

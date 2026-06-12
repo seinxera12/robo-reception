@@ -1,0 +1,11 @@
+# robo/.gitignore
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+*.egg-info/
+dist/
+.pytest_cache/
+.ruff_cache/
