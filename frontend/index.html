@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Robo — Voice Test</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #eee; padding: 2rem; }
+    #status { color: #0f0; font-size: 1.4rem; margin-bottom: 1rem; }
+    #transcript { color: #ff0; margin: 0.5rem 0; }
+    #response { color: #0ff; margin: 0.5rem 0; }
+    button { padding: 1rem 2rem; font-size: 1.2rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="status">Disconnected</div>
+  <div id="transcript">Transcript: —</div>
+  <div id="response">Response: —</div>
+  <button id="btn">Connect & Start</button>
+
+  <script>
+    const KIOSK_ID = "kiosk-01";
+    const WS_URL = `ws://${window.location.host}/ws/voice/${KIOSK_ID}`;
+    const SAMPLE_RATE = 16000;
+    const CHUNK_MS = 30;
+    const CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS / 1000; // 480
+
+    let ws, audioCtx, mediaStream, workletNode;
+    let playbackQueue = [];
+    let isPlaying = false;
+
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const responseEl = document.getElementById("response");
+    const btnEl = document.getElementById("btn");
+
+    // ── Console logging for debugging ──────────────────────
+    function log(msg, type = "info") {
+      const timestamp = new Date().toLocaleTimeString();
+      console.log(`[${timestamp}] ${type.toUpperCase()} | ${msg}`);
+      console.log(msg); // Always log to console
+    }
+
+    log(`Frontend initialized. WebSocket URL: ${WS_URL}`);
+
+    document.getElementById("btn").onclick = async () => {
+      log("Connect button clicked");
+      btnEl.disabled = true;
+      btnEl.textContent = "Connecting...";
+      try {
+        await connect();
+      } catch (err) {
+        log(`Connection error: ${err.message}`, "error");
+        statusEl.textContent = `Error: ${err.message}`;
+        btnEl.disabled = false;
+        btnEl.textContent = "Connect & Start";
+      }
+    };
+
+    async function connect() {
+      log("Starting connection flow...");
+
+      // ── Audio context ──────────────────────────────────────
+      log("Creating AudioContext...");
+      audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+      log(`✓ AudioContext created (sample rate: ${SAMPLE_RATE})`);
+
+      // ── Get mic permission ─────────────────────────────────
+      log("Requesting microphone permission...");
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log("✓ Microphone permission granted");
+      } catch (err) {
+        throw new Error(`Microphone permission denied: ${err.message}`);
+      }
+
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      log("✓ Media stream source created");
+
+      // ── Load AudioWorklet ──────────────────────────────────
+      log("Loading AudioWorklet from /static/worklet.js...");
+      try {
+        await audioCtx.audioWorklet.addModule("/static/worklet.js");
+        log("✓ AudioWorklet loaded");
+      } catch (err) {
+        throw new Error(`AudioWorklet load failed: ${err.message}`);
+      }
+
+      log("Creating AudioWorkletNode...");
+      workletNode = new AudioWorkletNode(audioCtx, "pcm-capture");
+      log("✓ AudioWorkletNode created");
+
+      source.connect(workletNode);
+      log("✓ Media stream connected to AudioWorklet");
+
+      // Receive PCM chunks from worklet → send over WebSocket
+      workletNode.port.onmessage = (e) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(e.data); // already Int16 PCM bytes from worklet
+        }
+      };
+
+      // ── WebSocket connection ───────────────────────────────
+      log(`Connecting to WebSocket: ${WS_URL}`);
+      ws = new WebSocket(WS_URL);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        log("✓ WebSocket connected");
+        statusEl.textContent = "Connected — speak now";
+        btnEl.textContent = "Disconnect";
+      };
+
+      ws.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+          const msg = JSON.parse(event.data);
+          log(`Message received: type=${msg.type}`, "debug");
+          handleControl(msg);
+        } else {
+          // Binary = audio chunk from TTS
+          log(`Audio chunk received (${event.data.byteLength} bytes)`, "debug");
+          playbackQueue.push(event.data);
+          if (!isPlaying) playNext();
+        }
+      };
+
+      ws.onerror = (error) => {
+        log(`WebSocket error: ${error}`, "error");
+        statusEl.textContent = "Error — check console";
+      };
+
+      ws.onclose = () => {
+        log("WebSocket disconnected");
+        statusEl.textContent = "Disconnected";
+        btnEl.disabled = false;
+        btnEl.textContent = "Connect & Start";
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(track => track.stop());
+        }
+      };
+
+      // Wait for connection to open
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("WebSocket connection timeout (5s)"));
+        }, 5000);
+
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          log("✓ WebSocket connected");
+          statusEl.textContent = "Connected — speak now";
+          btnEl.textContent = "Disconnect";
+          resolve();
+        };
+
+        ws.onerror = (error) => {
+          clearTimeout(timeout);
+          reject(new Error(`WebSocket error: ${error}`));
+        };
+      });
+    }
+
+    function handleControl(msg) {
+      if (msg.type === "state") {
+        log(`State change: ${msg.state}`);
+        statusEl.textContent = `State: ${msg.state}`;
+      } else if (msg.type === "transcript") {
+        log(`Transcript: ${msg.text}`);
+        transcriptEl.textContent = `Transcript: ${msg.text}`;
+      } else if (msg.type === "response") {
+        log(`Response: ${msg.text.substring(0, 50)}...`);
+        responseEl.textContent = `Response: ${msg.text}`;
+      } else if (msg.type === "audio_end") {
+        log("Audio stream complete");
+      }
+    }
+
+    async function playNext() {
+      if (playbackQueue.length === 0) {
+        isPlaying = false;
+        return;
+      }
+      isPlaying = true;
+      const arrayBuffer = playbackQueue.shift();
+
+      // Decode Int16 PCM → float32
+      const int16 = new Int16Array(arrayBuffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768.0;
+      }
+
+      const audioBuffer = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+      audioBuffer.copyToChannel(float32, 0);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
+      source.onended = playNext; // chain next chunk
+      source.start();
+    }
+  </script>
+</body>
+</html>
