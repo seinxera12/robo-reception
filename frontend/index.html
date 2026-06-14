@@ -42,12 +42,34 @@
       0%, 100% { opacity: 1; }
       50%       { opacity: 0.55; }
     }
+
+    /* Check-in status badges */
+    #badges { margin-top: 1rem; }
+    .badge {
+      display: inline-block;
+      padding: 0.3rem 0.8rem;
+      margin: 0.2rem;
+      border-radius: 1rem;
+      background: #333;
+      color: #888;
+      font-size: 0.9rem;
+      transition: background 0.3s, color 0.3s;
+    }
+    .badge.active {
+      background: #16a34a;
+      color: white;
+    }
   </style>
 </head>
 <body>
   <div id="status">Disconnected</div>
   <div id="transcript">Transcript: —</div>
   <div id="response">Response: —</div>
+  <div id="badges" style="margin-top: 1rem;">
+    <span id="badge-checkin"  class="badge">☐ Checked In</span>
+    <span id="badge-notified" class="badge">☐ Host Notified</span>
+    <span id="badge-ack"      class="badge">☐ Host On Their Way</span>
+  </div>
   <div id="debug" style="color:#888; font-size:0.85rem; margin-top:1rem; white-space:pre-wrap; max-height:200px; overflow-y:auto; border:1px solid #333; padding:0.5rem;"></div>
   <button id="btn">Connect &amp; Start</button>
   <button id="ptt-btn" class="idle">🎤 Tap to Speak</button>
@@ -144,6 +166,19 @@
       }
     }
 
+    // ── Badge helpers ─────────────────────────────────────────────────────────
+    function setBadge(id, active) {
+      const el = document.getElementById(id);
+      if (active) el.classList.add("active");
+      else el.classList.remove("active");
+    }
+
+    function resetBadges() {
+      ["badge-checkin", "badge-notified", "badge-ack"].forEach(id => {
+        document.getElementById(id).classList.remove("active");
+      });
+    }
+
     function disconnect() {
       log("Disconnecting...");
       if (ws) ws.close();
@@ -154,6 +189,7 @@
       connected = false;
       pttEl.style.display = "none";
       setPttState("idle");
+      resetBadges();
       if (workletNode) { workletNode.disconnect(); workletNode = null; }
       if (audioCtx)    { audioCtx.close();         audioCtx = null;    }
       if (mediaStream) {
@@ -169,6 +205,7 @@
 
     async function connect() {
       log("Starting connection flow...");
+      resetBadges();
 
       // ── Audio context ─────────────────────────────────────
       audioCtx = new AudioContext({ sampleRate: MIC_SAMPLE_RATE });
@@ -305,6 +342,18 @@
         transcriptEl.textContent = `Transcript: ${msg.text}`;
       } else if (msg.type === "response") {
         responseEl.textContent = `Response: ${msg.text}`;
+      } else if (msg.type === "ui_update") {
+        if (msg.event === "checkin_complete") {
+          setBadge("badge-checkin", true);
+          log("Badge: checked in ✓");
+        } else if (msg.event === "notification_sent") {
+          setBadge("badge-notified", true);
+          log(`Badge: host notified — ${msg.host_name}`);
+        } else if (msg.event === "host_acknowledged") {
+          setBadge("badge-ack", true);
+          responseEl.textContent = `${msg.host_name} is on their way to meet you.`;
+          log("Host acknowledged: " + JSON.stringify(msg));
+        }
       } else if (msg.type === "audio_end") {
         // audio_end is sent right before the final "idle" state — nothing extra needed,
         // the state === "idle" handler above covers the reset.
