@@ -46,6 +46,7 @@ LOG_LEVELS = {
     "starlette":                    logging.WARNING,
     "uvicorn":                      logging.WARNING,   # uvicorn prints its own banner
     "uvicorn.access":               logging.WARNING,
+    "watchfiles":                   logging.WARNING,   # suppress .venv change detection spam
     "transformers":                 logging.WARNING,
     "huggingface_hub":              logging.WARNING,
     "requests":                     logging.WARNING,

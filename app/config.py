@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
 
     # Database
-    database_url: str = "postgresql+asyncpg://reception:reception@postgres:5433/reception"
+    database_url: str = "postgresql+asyncpg://reception:reception@postgres:5432/reception"
     alembic_database_url: str | None = None 
 
     # Redis

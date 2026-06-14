@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 import asyncio
 
@@ -29,12 +30,16 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
 
     try:
-        # Migrations
+        # Migrations — run in a thread so the event loop stays free
         logger.info("Applying database migrations...")
         from alembic.config import Config
         from alembic import command
-        alembic_cfg = Config("alembic.ini")
-        command.upgrade(alembic_cfg, "head")
+
+        def _run_migrations():
+            alembic_cfg = Config("alembic.ini")
+            command.upgrade(alembic_cfg, "head")
+
+        await asyncio.to_thread(_run_migrations)
         logger.info("✓ Migrations applied")
 
         # Redis
@@ -72,6 +77,19 @@ async def lifespan(app: FastAPI):
         except asyncio.TimeoutError:
             logger.error("✗ TTS model loading timed out (5 min)")
             raise
+
+        # ── Agent ─────────────────────────────────────────────────────────
+        # Validate Groq API key presence
+        if not settings.groq_api_key:
+            logger.warning("⚠  GROQ_API_KEY not set — agent will fail on first utterance")
+        else:
+            logger.info("✓ Groq API key configured")
+
+        # Import agent — triggers tool registration, surfaces any import errors at boot
+        logger.info("Initializing agent and registering tools...")
+        from app.agent.core import agent as _agent  # noqa: F401
+        tool_names = list(_agent._function_toolset.tools.keys())
+        logger.info(f"✓ Agent ready — tools: {tool_names}")
 
         logger.info("=" * 70)
         logger.info("✓ Robo ready — all systems operational!")
