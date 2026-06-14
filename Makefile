@@ -11,10 +11,10 @@ reset:
 	docker compose up -d --build
 
 seed:
-	docker compose exec robo-api python seed.py
+	docker compose exec reception-api python seed.py
 
 logs:
-	docker compose logs -f robo-api
+	docker compose logs -f reception
 
 smoke:
 	pytest tests/integration/ -x -q
