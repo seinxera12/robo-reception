@@ -20,9 +20,22 @@ LOG_LEVELS = {
     "app.voice.tts":            logging.INFO,
     "app.session":              logging.INFO,
     "app.session.manager":      logging.INFO,
-    "app.agent":                logging.DEBUG,
-    "app.tools":                logging.DEBUG,
-    "app.notifications":        logging.DEBUG,
+    "app.agent":                logging.INFO,   # core agent flow — INFO keeps it readable
+    "app.tools":                logging.INFO,   # tool call/result summaries at INFO only
+
+    # === pydantic-ai internals — silent ===
+    "pydantic_ai":              logging.WARNING,
+    "pydantic_ai._internal":    logging.WARNING,
+    "pydantic_ai.models":       logging.WARNING,
+    "pydantic_ai.tools":        logging.WARNING,
+
+    # === logfire (pydantic-ai telemetry) — silent ===
+    "logfire":                  logging.WARNING,
+    "logfire._internal":        logging.WARNING,
+
+    # === groq SDK ===
+    "groq":                     logging.WARNING,
+    "groq._base_client":        logging.WARNING,
 
     # === Third-party — quiet ===
     "torch":                        logging.WARNING,
@@ -39,6 +52,7 @@ LOG_LEVELS = {
     "alembic.runtime.migration":    logging.INFO,      # keep actual migration lines
     "redis":                        logging.WARNING,
     "httpx":                        logging.WARNING,
+    "httpx2":                       logging.WARNING,
     "httpcore":                     logging.WARNING,
     "websockets":                   logging.WARNING,
     "asyncio":                      logging.WARNING,
@@ -53,6 +67,7 @@ LOG_LEVELS = {
     "urllib":                       logging.WARNING,
     "asyncpg":                      logging.WARNING,
     "py.warnings":                  logging.WARNING,   # torch UserWarning / FutureWarning
+    "key_value":                    logging.WARNING,   # pydantic-ai key-value adapter
 }
 
 
@@ -96,6 +111,12 @@ def suppress_library_spam() -> None:
     """Optional extra suppression; call after setup_logging()."""
     logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
     logging.getLogger("silero_vad").setLevel(logging.WARNING)
+    logging.getLogger("logfire").setLevel(logging.WARNING)
+    logging.getLogger("logfire._internal").setLevel(logging.WARNING)
+    logging.getLogger("groq").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logging.getLogger("key_value").setLevel(logging.WARNING)
 
     try:
         import transformers

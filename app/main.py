@@ -11,6 +11,7 @@ import traceback
 from app.config import settings
 from app.db.session import engine
 from app.api.health import router as health_router
+from app.api.acknowledge import router as acknowledge_router
 from app.voice.ws_handler import router as ws_router
 from app.logging_config import setup_logging, suppress_library_spam
 
@@ -124,6 +125,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Robo Reception Assistant", lifespan=lifespan)
 
 app.include_router(health_router)
+app.include_router(acknowledge_router)
 app.include_router(ws_router)
 
 
