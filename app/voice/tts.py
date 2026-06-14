@@ -1,19 +1,16 @@
 import asyncio
+import io
 import os
+import sys
 import warnings
-
-# Must be set before kokoro/huggingface imports
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-# Kokoro prints this directly via warnings.warn before we can intercept it
-warnings.filterwarnings("ignore", message=r".*Defaulting repo_id.*")
-
 import re
 import time
 import logging
 import numpy as np
 from typing import AsyncIterator
+
+# Kokoro prints this directly via warnings.warn before we can intercept it
+warnings.filterwarnings("ignore", message=r".*Defaulting repo_id.*")
 
 logger = logging.getLogger(__name__)
 
@@ -25,35 +22,55 @@ VOICE = "af_heart"    # default Kokoro voice — warm, neutral, reception-approp
 def load_tts_model():
     """Load and warm up Kokoro. Call once from lifespan."""
     global _pipeline
-    
+
     logger.info("Loading TTS model (Kokoro American English)...")
     logger.info("  Importing KPipeline...")
-    
-    from kokoro import KPipeline
-    logger.info("  ✓ KPipeline imported")
-    
-    logger.info("  Creating pipeline (may take 30-60s on first run)...")
-    t0 = time.time()
 
+    # Kokoro ships its model files locally (installed via pip), so it doesn't
+    # need to reach HuggingFace Hub at runtime. We set these flags only for the
+    # duration of the Kokoro import/init so we don't interfere with other model
+    # downloads (e.g. Whisper STT) that DO need network access.
+    _prev_hf_offline = os.environ.get("HF_HUB_OFFLINE")
+    _prev_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    t0 = time.time()
     try:
-        # Kokoro emits a repo_id warning via print() to stderr — redirect to suppress it
-        import io
-        _stderr_capture = io.StringIO()
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r".*Defaulting repo_id.*")
-            warnings.filterwarnings("ignore", message=r".*dropout option.*")
-            warnings.filterwarnings("ignore", message=r".*weight_norm.*")
-            import sys as _sys
-            _real_stderr, _sys.stderr = _sys.stderr, _stderr_capture
-            try:
-                _pipeline = KPipeline(lang_code="a")
-            finally:
-                _sys.stderr = _real_stderr
-        elapsed = time.time() - t0
-        logger.info(f"  ✓ Pipeline created ({elapsed:.1f}s)")
-    except Exception as e:
-        logger.exception(f"  ✗ Pipeline creation failed: {e}")
-        raise
+        from kokoro import KPipeline
+        logger.info("  ✓ KPipeline imported")
+
+        logger.info("  Creating pipeline (may take 30-60s on first run)...")
+
+        try:
+            # Kokoro emits a repo_id warning via print() to stderr — redirect to suppress it
+            _stderr_capture = io.StringIO()
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r".*Defaulting repo_id.*")
+                warnings.filterwarnings("ignore", message=r".*dropout option.*")
+                warnings.filterwarnings("ignore", message=r".*weight_norm.*")
+                _real_stderr, sys.stderr = sys.stderr, _stderr_capture
+                try:
+                    _pipeline = KPipeline(lang_code="a")
+                finally:
+                    sys.stderr = _real_stderr
+            elapsed = time.time() - t0
+            logger.info(f"  ✓ Pipeline created ({elapsed:.1f}s)")
+        except Exception as e:
+            logger.exception(f"  ✗ Pipeline creation failed: {e}")
+            raise
+    finally:
+        # Always restore the previous HF_HUB_OFFLINE state so other loaders
+        # (e.g. Whisper) are not blocked from downloading their models.
+        if _prev_hf_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = _prev_hf_offline
+
+        if _prev_tf_offline is None:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = _prev_tf_offline
 
     logger.info("  Pre-warming pipeline (synthesizing test phrase)...")
     t_warm = time.time()

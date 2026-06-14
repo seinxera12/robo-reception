@@ -1,20 +1,18 @@
 import asyncio
 import json
 import logging
+import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.voice.vad import VADProcessor
 from app.voice.stt import transcribe
-from app.voice.tts import synthesise
+from app.voice.tts import synthesise_stream
 from app.session.manager import SessionManager
+from app.agent.core import run_agent
+from app.agent.models import RoboDeps
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-HARDCODED_RESPONSE = (
-    "Thank you, I heard you. I am Robo, your reception assistant. "
-    "I will be able to look up your appointment and notify your host very soon."
-)
 
 
 @router.websocket("/ws/voice/{kiosk_id}")
@@ -49,48 +47,95 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
         await send_json({"type": "state", "state": "idle"})
         logger.info("  Voice loop started")
 
+        _chunk_count = 0
+        _speaking_logged = False
+
         async for message in websocket.iter_bytes():
             try:
+                _chunk_count += 1
+
+                # Log first chunk and then every 200 to prove data is arriving
+                if _chunk_count == 1:
+                    logger.info(f"  ← First PCM chunk received: {len(message)} bytes")
+                elif _chunk_count % 200 == 0:
+                    logger.info(f"  ← PCM chunks received: {_chunk_count}, last chunk: {len(message)} bytes")
+
                 # ── VAD ───────────────────────────────────────────────────────
                 is_speaking, utterance_bytes = vad.process_chunk(message)
 
-                if is_speaking:
+                if is_speaking and not _speaking_logged:
+                    logger.info("  VAD: speech detected — listening")
+                    _speaking_logged = True
                     await send_json({"type": "state", "state": "listening"})
+                elif is_speaking:
+                    await send_json({"type": "state", "state": "listening"})
+                elif not is_speaking and _speaking_logged:
+                    # Speech ended (silence threshold) but no utterance yet
+                    pass
 
                 if utterance_bytes is None:
                     continue
+
+                # Utterance complete — reset speaking flag for next one
+                _speaking_logged = False
+                logger.info(f"  VAD: utterance complete — {len(utterance_bytes)} bytes")
 
                 # ── STT ───────────────────────────────────────────────────────
                 await send_json({"type": "state", "state": "thinking"})
                 logger.info("  STT: transcribing utterance...")
 
+                t_utterance_end = time.time()
                 # transcribe blocks — run in thread so event loop stays free
                 transcript = await asyncio.to_thread(transcribe, utterance_bytes)
+                t_stt_done = time.time()
 
                 if not transcript.strip():
                     logger.warning("  STT: empty result, back to idle")
                     await send_json({"type": "state", "state": "idle"})
                     continue
 
-                logger.info(f"  STT: '{transcript}'")
+                logger.info(f"  STT ({t_stt_done - t_utterance_end:.2f}s): '{transcript}'")
                 await send_json({"type": "transcript", "text": transcript})
 
-                # ── Response ──────────────────────────────────────────────────
-                response_text = HARDCODED_RESPONSE
+                # ── Agent ─────────────────────────────────────────────────────
+                session_data = await session_manager.get(kiosk_id, session_uuid) or {}
+
+                deps = RoboDeps(
+                    kiosk_id=kiosk_id,
+                    session_uuid=session_uuid,
+                    visitor_name=session_data.get("visitor_name"),
+                    current_appointment_id=session_data.get("current_appointment_id"),
+                )
+                conversation_history = session_data.get("conversation_history", [])
+
+                response_text = await run_agent(transcript, deps, conversation_history)
+                t_agent_done = time.time()
+                logger.info(
+                    f"  Agent ({t_agent_done - t_stt_done:.2f}s): '{response_text[:80]}'"
+                )
+
+                # Persist session — conversation history serialisation is Day 4
+                await session_manager.update(kiosk_id, session_uuid, {})
+
+                # ── TTS (streaming) ───────────────────────────────────────────
                 await send_json({"type": "response", "text": response_text})
-
-                # ── TTS ───────────────────────────────────────────────────────
                 await send_json({"type": "state", "state": "speaking"})
-                logger.info("  TTS: synthesizing...")
+                logger.info("  TTS: streaming...")
 
-                # synthesise blocks — run in thread, returns all PCM at once
-                pcm_chunks = await asyncio.to_thread(synthesise, response_text)
+                first_chunk = True
+                async for audio_chunk in synthesise_stream(response_text):
+                    if first_chunk:
+                        t_first_tts = time.time()
+                        logger.info(
+                            f"  LATENCY — STT: {t_stt_done - t_utterance_end:.2f}s | "
+                            f"Agent: {t_agent_done - t_stt_done:.2f}s | "
+                            f"TTS first byte: {t_first_tts - t_agent_done:.2f}s | "
+                            f"Total: {t_first_tts - t_utterance_end:.2f}s"
+                        )
+                        first_chunk = False
+                    await websocket.send_bytes(audio_chunk)
 
-                for i, chunk in enumerate(pcm_chunks, 1):
-                    await websocket.send_bytes(chunk)
-                    logger.debug(f"  TTS: sent chunk {i}/{len(pcm_chunks)} ({len(chunk)} bytes)")
-
-                logger.info(f"  TTS: complete ({len(pcm_chunks)} chunks)")
+                logger.info("  TTS: complete")
                 await send_json({"type": "audio_end"})
                 await send_json({"type": "state", "state": "idle"})
 
