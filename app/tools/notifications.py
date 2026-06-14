@@ -94,11 +94,18 @@ async def notify_host(
 
         # ── Publish event for browser badge ───────────────────────────────
         if ctx.deps.redis is not None:
-            await ctx.deps.redis.publish("robo:events", json.dumps({
+            _payload = json.dumps({
                 "type": "notification_sent",
                 "appointment_id": appointment_id,
                 "host_name": host.name,
-            }))
+            })
+            _receivers = await ctx.deps.redis.publish("robo:events", _payload)
+            logger.info(
+                f"  [DIAG] publish notification_sent → robo:events "
+                f"receivers={_receivers} (0 = no active subscriber)"
+            )
+        else:
+            logger.warning("  [DIAG] publish notification_sent SKIPPED — ctx.deps.redis is None")
 
         return NotifyResult(
             sent=True,

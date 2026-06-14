@@ -53,8 +53,11 @@ async def acknowledge(appointment_id: str, request: Request):
             "visitor_name": appt.visitor_name,
             "host_name": host.name,
         })
-        await redis.publish("robo:events", event)
-        logger.info(f"Redis event published: host_acknowledged for {appointment_id}")
+        receivers = await redis.publish("robo:events", event)
+        logger.info(
+            f"Redis event published: host_acknowledged for {appointment_id} "
+            f"receivers={receivers} (0 = kiosk not subscribed or WebSocket disconnected)"
+        )
 
         # Friendly confirmation page shown on the host's phone
         return HTMLResponse(content=f"""<!DOCTYPE html>

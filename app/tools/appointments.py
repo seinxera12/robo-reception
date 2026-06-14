@@ -1,7 +1,7 @@
 # app/tools/appointments.py
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date as Date,datetime, timezone
 from sqlalchemy import text, select
 from pydantic import BaseModel
 from pydantic_ai import RunContext
@@ -162,7 +162,7 @@ async def check_availability(
 
         host_id = str(host_row.id)
         resolved_name = host_row.name
-
+        query_date = Date.fromisoformat(date)
         # Query all slots for this host on the given date (both booked and free)
         slots_query = text("""
             SELECT slot_start, slot_end, is_booked
@@ -172,7 +172,7 @@ async def check_availability(
             ORDER BY slot_start
         """)
         slots_result = await session.execute(
-            slots_query, {"host_id": host_id, "date": date}
+            slots_query, {"host_id": host_id, "date": query_date}
         )
         slot_rows = slots_result.fetchall()
 
@@ -247,10 +247,17 @@ async def update_checkin_status(
 
         # Publish event so the WebSocket listener can update the browser badge
         if ctx.deps.redis is not None:
-            await ctx.deps.redis.publish("robo:events", json.dumps({
+            _payload = json.dumps({
                 "type": "checkin_complete",
                 "appointment_id": appointment_id,
-            }))
+            })
+            _receivers = await ctx.deps.redis.publish("robo:events", _payload)
+            logger.info(
+                f"  [DIAG] publish checkin_complete → robo:events "
+                f"receivers={_receivers} (0 = no active subscriber)"
+            )
+        else:
+            logger.warning("  [DIAG] publish checkin_complete SKIPPED — ctx.deps.redis is None")
 
         return CheckinResult(
             success=True,
