@@ -21,7 +21,7 @@ def _load_faq() -> dict:
     if not _faq:
         with open(_FAQ_PATH, "r", encoding="utf-8") as f:
             _faq = json.load(f)
-        logger.info(f"FAQ loaded: {list(_faq.keys())}")
+        logger.debug(f"  get_info: FAQ loaded — {list(_faq.keys())}")
     return _faq
 
 
@@ -35,22 +35,22 @@ async def get_info(
     Supported topics: hours, parking, wifi, accessibility, cafeteria, security.
     Use this tool whenever a visitor asks about building facilities, rules, or services.
     """
-    logger.info(f"Tool: get_info(query_type={query_type!r})")
     faq = _load_faq()
+    key = query_type.lower().strip()
 
     # Exact match first (case-insensitive)
-    key = query_type.lower().strip()
     if key in faq:
+        logger.info(f"  get_info: '{key}' → exact match")
         return InfoResult(found=True, query_type=key, answer=faq[key])
 
     # Fuzzy match via difflib
     matches = get_close_matches(key, faq.keys(), n=1, cutoff=0.5)
     if matches:
         matched_key = matches[0]
-        logger.info(f"FAQ fuzzy match: '{query_type}' → '{matched_key}'")
+        logger.info(f"  get_info: '{query_type}' → fuzzy match '{matched_key}'")
         return InfoResult(found=True, query_type=matched_key, answer=faq[matched_key])
 
-    logger.info(f"FAQ miss: '{query_type}'")
+    logger.info(f"  get_info: '{query_type}' → no match")
     return InfoResult(
         found=False,
         query_type=query_type,

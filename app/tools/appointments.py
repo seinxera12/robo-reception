@@ -1,6 +1,9 @@
 # app/tools/appointments.py
+import json
 import logging
+from datetime import datetime, timezone
 from sqlalchemy import text, select
+from pydantic import BaseModel
 from pydantic_ai import RunContext
 
 from app.agent.core import agent
@@ -45,7 +48,6 @@ async def lookup_appointment(
                 found=False,
                 message=f"No scheduled appointment found with code '{appointment_code}'."
             )
-
         # ── Name-based fuzzy lookup (pg_trgm similarity) ──────────────────
         if not visitor_name:
             return AppointmentMatch(
@@ -89,8 +91,8 @@ async def lookup_appointment(
 
         if confidence >= 0.45:
             logger.info(
-                f"Appointment match: '{best.visitor_name}' "
-                f"(score={confidence:.2f}, code={best.appointment_code})"
+                f"  lookup: matched '{best.visitor_name}' "
+                f"conf={confidence:.2f} host={best.host_name} room={best.room}"
             )
             return AppointmentMatch(
                 found=True,
@@ -109,8 +111,8 @@ async def lookup_appointment(
         # Low confidence — return candidate names so the agent can ask to clarify
         suggestions = [r.visitor_name for r in rows if float(r.score) > 0.2]
         logger.info(
-            f"Low confidence lookup ({confidence:.2f}) for '{visitor_name}' "
-            f"— suggestions: {suggestions}"
+            f"  lookup: low confidence ({confidence:.2f}) for {visitor_name!r}"
+            f" — suggestions: {suggestions}"
         )
         return AppointmentMatch(
             found=False,
@@ -186,7 +188,7 @@ async def check_availability(
         ]
 
         logger.info(
-            f"Availability: '{resolved_name}' has {len(open_slots)} open slot(s) on {date}"
+            f"  availability: '{resolved_name}' → {len(open_slots)} open slot(s) on {date}"
         )
 
         return AvailabilityResult(
@@ -195,6 +197,65 @@ async def check_availability(
             host_id=host_id,
             slots=open_slots,
             message=f"{resolved_name} has {len(open_slots)} open slot(s) on {date}.",
+        )
+
+
+# ── Tool 3: update_checkin_status ─────────────────────────────────────────
+
+class CheckinResult(BaseModel):
+    success: bool
+    appointment_id: str | None = None
+    message: str = ""
+
+
+@agent.tool
+async def update_checkin_status(
+    ctx: RunContext[RoboDeps],
+    appointment_id: str,
+) -> CheckinResult:
+    """
+    Mark a visitor as checked in. Call this after lookup_appointment succeeds
+    and the visitor has confirmed their details.
+    Sets status to checked_in and records the check-in timestamp.
+    """
+    logger.info(f"Tool: update_checkin_status(appointment_id={appointment_id})")
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Appointment).where(Appointment.id == appointment_id)
+        )
+        appt = result.scalar_one_or_none()
+
+        if not appt:
+            return CheckinResult(
+                success=False,
+                message=f"Appointment {appointment_id} not found."
+            )
+
+        if appt.status == AppointmentStatus.checked_in:
+            return CheckinResult(
+                success=True,
+                appointment_id=appointment_id,
+                message="Visitor was already checked in."
+            )
+
+        appt.status = AppointmentStatus.checked_in
+        appt.check_in_at = datetime.now(timezone.utc)
+        await session.commit()
+
+        logger.info(f"  checkin: ✓ appointment {appointment_id[:8]}… → checked_in")
+
+        # Publish event so the WebSocket listener can update the browser badge
+        if ctx.deps.redis is not None:
+            await ctx.deps.redis.publish("robo:events", json.dumps({
+                "type": "checkin_complete",
+                "appointment_id": appointment_id,
+            }))
+
+        return CheckinResult(
+            success=True,
+            appointment_id=appointment_id,
+            message="Visitor successfully checked in."
         )
 
 
