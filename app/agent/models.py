@@ -1,4 +1,5 @@
 # app/agent/models.py
+from typing import Any
 from pydantic import BaseModel
 
 
@@ -47,5 +48,6 @@ class RoboDeps(BaseModel):
     session_uuid: str
     visitor_name: str | None = None            # populated after successful lookup
     current_appointment_id: str | None = None  # populated after successful lookup
+    redis: Any = None                          # injected from ws_handler for pub/sub events
 
     model_config = {"arbitrary_types_allowed": True}
