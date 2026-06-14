@@ -9,6 +9,39 @@
     #transcript { color: #ff0; margin: 0.5rem 0; }
     #response { color: #0ff; margin: 0.5rem 0; }
     button { padding: 1rem 2rem; font-size: 1.2rem; cursor: pointer; }
+
+    /* PTT button states */
+    #ptt-btn {
+      display: none;
+      padding: 1.2rem 2.4rem;
+      font-size: 1.3rem;
+      cursor: pointer;
+      border-radius: 8px;
+      border: 2px solid #555;
+      background: #222;
+      color: #eee;
+      transition: background 0.15s, border-color 0.15s;
+      margin-top: 0.8rem;
+    }
+    #ptt-btn.idle {
+      border-color: #0a0;
+      color: #0f0;
+    }
+    #ptt-btn.recording {
+      border-color: #f80;
+      color: #f80;
+      background: #221a00;
+      animation: pulse 0.9s ease-in-out infinite;
+    }
+    #ptt-btn.busy {
+      border-color: #555;
+      color: #888;
+      cursor: not-allowed;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.55; }
+    }
   </style>
 </head>
 <body>
@@ -17,28 +50,36 @@
   <div id="response">Response: —</div>
   <div id="debug" style="color:#888; font-size:0.85rem; margin-top:1rem; white-space:pre-wrap; max-height:200px; overflow-y:auto; border:1px solid #333; padding:0.5rem;"></div>
   <button id="btn">Connect &amp; Start</button>
+  <button id="ptt-btn" class="idle">🎤 Tap to Speak</button>
 
   <script>
     const KIOSK_ID = "kiosk-01";
     const WS_URL = `ws://${window.location.host}/ws/voice/${KIOSK_ID}`;
-    const SAMPLE_RATE = 16000;
+    const MIC_SAMPLE_RATE = 16000;   // microphone capture & VAD rate
+    const TTS_SAMPLE_RATE = 24000;   // Kokoro TTS output rate — MUST match tts.py SAMPLE_RATE
 
     let ws, audioCtx, mediaStream, workletNode;
     let playbackQueue = [];
     let isPlaying = false;
     let connected = false;
 
+    // ── PTT state ─────────────────────────────────────────────────────────────
+    // "idle"      — ready to record (tap to activate)
+    // "recording" — actively forwarding PCM chunks to the backend
+    // "busy"      — backend is processing / speaking; button is locked
+    let pttState = "idle";
+
     const statusEl    = document.getElementById("status");
     const transcriptEl = document.getElementById("transcript");
     const responseEl  = document.getElementById("response");
     const debugEl     = document.getElementById("debug");
     const btnEl       = document.getElementById("btn");
+    const pttEl       = document.getElementById("ptt-btn");
 
     function log(msg, type = "info") {
       const ts = new Date().toLocaleTimeString();
       const line = `[${ts}] ${type.toUpperCase()} | ${msg}`;
       console.log(line);
-      // Also show last 20 lines on screen
       const lines = (debugEl.textContent + "\n" + line).split("\n").slice(-20);
       debugEl.textContent = lines.join("\n");
       debugEl.scrollTop = debugEl.scrollHeight;
@@ -46,6 +87,7 @@
 
     log(`Frontend initialized. WebSocket URL: ${WS_URL}`);
 
+    // ── Connect / disconnect button ───────────────────────────────────────────
     btnEl.onclick = async () => {
       if (connected) {
         disconnect();
@@ -56,10 +98,13 @@
       btnEl.textContent = "Connecting...";
       try {
         await connect();
-        // connect() resolves only after WS is open
         connected = true;
         btnEl.disabled = false;
         btnEl.textContent = "Disconnect";
+
+        // Show PTT button once connected
+        pttEl.style.display = "inline-block";
+        setPttState("idle");
       } catch (err) {
         log(`Connection error: ${err.message}`, "error");
         statusEl.textContent = `Error: ${err.message}`;
@@ -67,6 +112,37 @@
         btnEl.textContent = "Connect & Start";
       }
     };
+
+    // ── PTT button ────────────────────────────────────────────────────────────
+    pttEl.onclick = () => {
+      if (!connected) return;
+
+      if (pttState === "idle") {
+        // Start a new recording session
+        setPttState("recording");
+        log("PTT: recording started — forwarding audio to backend");
+      } else if (pttState === "recording") {
+        // User taps again to cancel before VAD fires utterance complete
+        setPttState("idle");
+        log("PTT: recording cancelled by user");
+      }
+      // "busy" taps are ignored — button is visually disabled
+    };
+
+    function setPttState(state) {
+      pttState = state;
+      pttEl.className = state; // "idle" | "recording" | "busy"
+      if (state === "idle") {
+        pttEl.textContent = "🎤 Tap to Speak";
+        pttEl.disabled = false;
+      } else if (state === "recording") {
+        pttEl.textContent = "🔴 Listening…  (tap to cancel)";
+        pttEl.disabled = false;
+      } else {
+        pttEl.textContent = "⏳ Processing…";
+        pttEl.disabled = true;
+      }
+    }
 
     function disconnect() {
       log("Disconnecting...");
@@ -76,6 +152,8 @@
 
     function cleanup() {
       connected = false;
+      pttEl.style.display = "none";
+      setPttState("idle");
       if (workletNode) { workletNode.disconnect(); workletNode = null; }
       if (audioCtx)    { audioCtx.close();         audioCtx = null;    }
       if (mediaStream) {
@@ -93,11 +171,7 @@
       log("Starting connection flow...");
 
       // ── Audio context ─────────────────────────────────────
-      // Request 16kHz directly; browsers may resample but the worklet
-      // operates on whatever rate the context actually runs at.
-      audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-
-      // Resume in case autoplay policy suspended the context
+      audioCtx = new AudioContext({ sampleRate: MIC_SAMPLE_RATE });
       if (audioCtx.state === "suspended") {
         await audioCtx.resume();
       }
@@ -108,7 +182,7 @@
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            sampleRate: SAMPLE_RATE,
+            sampleRate: MIC_SAMPLE_RATE,
             channelCount: 1,
             echoCancellation: true,
             noiseSuppression: true,
@@ -133,11 +207,10 @@
 
       workletNode = new AudioWorkletNode(audioCtx, "pcm-capture");
       source.connect(workletNode);
-      // Do NOT connect workletNode to destination — we don't want mic playback.
-      // The graph stays active as long as source is connected to workletNode.
+      // Do NOT connect workletNode to destination — no mic playback.
       log("✓ AudioWorklet graph connected");
 
-      // Debug: count chunks sent to backend and log every 100
+      // Debug counters
       let chunkCount = 0;
       let bytesSent = 0;
 
@@ -146,14 +219,16 @@
       ws = new WebSocket(WS_URL);
       ws.binaryType = "arraybuffer";
 
-      // Wire up worklet → WS now that ws exists
+      // ── PTT gate: only forward chunks when pttState === "recording" ──────
+      // The worklet runs continuously so the AudioContext/graph stays warm and
+      // avoids any startup latency. Chunks are simply discarded when not recording.
       workletNode.port.onmessage = (e) => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN && pttState === "recording") {
           ws.send(e.data);
           chunkCount++;
           bytesSent += e.data.byteLength;
           if (chunkCount === 1) {
-            log(`First PCM chunk sent: ${e.data.byteLength} bytes (sampleRate=${audioCtx.sampleRate})`);
+            log(`First PTT PCM chunk sent: ${e.data.byteLength} bytes (sampleRate=${audioCtx.sampleRate})`);
           }
           if (chunkCount % 100 === 0) {
             log(`PCM chunks sent: ${chunkCount}, total bytes: ${bytesSent}`);
@@ -177,8 +252,6 @@
         cleanup();
       };
 
-      // Wait for the connection to open (or fail/timeout).
-      // onerror and onopen are set here only — avoid duplicate assignments.
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error("WebSocket connection timeout (5s)"));
@@ -187,8 +260,7 @@
         ws.onopen = () => {
           clearTimeout(timeout);
           log("✓ WebSocket open");
-          statusEl.textContent = "Connected — speak now";
-          // After open, replace error handler with steady-state one
+          statusEl.textContent = "Connected — tap to speak";
           ws.onerror = (err) => {
             log(`WebSocket error: ${err}`, "error");
             statusEl.textContent = "Error — check console";
@@ -207,10 +279,36 @@
     function handleControl(msg) {
       if (msg.type === "state") {
         statusEl.textContent = `State: ${msg.state}`;
+
+        if (msg.state === "listening") {
+          // VAD picked up speech — show the user we're actively capturing
+          if (pttState === "recording") {
+            pttEl.textContent = "🔴 Listening…  (tap to cancel)";
+          }
+        } else if (msg.state === "thinking" || msg.state === "speaking") {
+          // Utterance has been handed off — stop forwarding audio and lock the button
+          // until the full response cycle completes (audio_end → idle)
+          if (pttState === "recording") {
+            setPttState("busy");
+            log("PTT: utterance captured — backend processing");
+          }
+        } else if (msg.state === "idle") {
+          // Backend is back to idle (after speaking or empty STT result)
+          // Only re-enable the button if it was in busy state (not if user cancelled)
+          if (pttState === "busy") {
+            setPttState("idle");
+            log("PTT: ready for next utterance");
+          }
+        }
+
       } else if (msg.type === "transcript") {
         transcriptEl.textContent = `Transcript: ${msg.text}`;
       } else if (msg.type === "response") {
         responseEl.textContent = `Response: ${msg.text}`;
+      } else if (msg.type === "audio_end") {
+        // audio_end is sent right before the final "idle" state — nothing extra needed,
+        // the state === "idle" handler above covers the reset.
+        log("PTT: audio playback complete");
       }
     }
 
@@ -225,8 +323,9 @@
         float32[i] = int16[i] / 32768.0;
       }
 
-      // Use the actual context sample rate for playback
-      const audioBuffer = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+      // TTS audio is 24kHz — must match Kokoro's output rate, NOT the mic capture rate.
+      // Passing the wrong rate here causes pitch/speed distortion (e.g. 16kHz → 1.5× slower, deeper voice).
+      const audioBuffer = audioCtx.createBuffer(1, float32.length, TTS_SAMPLE_RATE);
       audioBuffer.copyToChannel(float32, 0);
 
       const src = audioCtx.createBufferSource();
