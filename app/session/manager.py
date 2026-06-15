@@ -1,7 +1,10 @@
+import asyncio
 import uuid
 import json
 import logging
 from datetime import datetime, timezone
+
+from redis.exceptions import WatchError
 
 from app.config import settings
 
@@ -27,6 +30,8 @@ class SessionManager:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "visitor_name": None,
             "current_appointment_id": None,
+            "host_id": None,
+            "checkin_stage": "idle",
             "conversation_history": [],
         }
 
@@ -39,11 +44,26 @@ class SessionManager:
         raw = await self.redis.get(key)
         return json.loads(raw) if raw else None
 
-    async def update(self, kiosk_id: str, session_uuid: str, updates: dict):
+    async def update(self, kiosk_id: str, session_uuid: str, updates: dict, retries: int = 3):
         key = self._key(kiosk_id, session_uuid)
-        data = await self.get(kiosk_id, session_uuid) or {}
-        data.update(updates)
-        await self.redis.setex(key, SESSION_TTL, json.dumps(data))
+        for attempt in range(retries):
+            async with self.redis.pipeline() as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    data = json.loads(raw) if raw else {}
+                    data.update(updates)
+                    pipe.multi()
+                    pipe.setex(key, SESSION_TTL, json.dumps(data))
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    if attempt == retries - 1:
+                        logger.warning(
+                            f"SessionManager.update: WatchError after {retries} retries for {key}"
+                        )
+                        raise
+                    await asyncio.sleep(0.01 * (attempt + 1))
 
     async def delete(self, kiosk_id: str, session_uuid: str):
         key = self._key(kiosk_id, session_uuid)

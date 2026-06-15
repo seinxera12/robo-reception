@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.18.4",
+    "appraise>=1.2.6",
     "asyncpg>=0.31.0",
     "fastapi>=0.136.3",
     "faster-whisper>=1.2.1",

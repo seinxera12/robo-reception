@@ -11,7 +11,10 @@ import traceback
 from app.config import settings
 from app.db.session import engine
 from app.api.health import router as health_router
+from app.api.acknowledge import router as acknowledge_router
 from app.voice.ws_handler import router as ws_router
+from app.voice.tts_handler import router as tts_router
+from app.chat.http_handler import router as chat_router
 from app.logging_config import setup_logging, suppress_library_spam
 
 # Setup logging FIRST before any other module imports
@@ -124,7 +127,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Robo Reception Assistant", lifespan=lifespan)
 
 app.include_router(health_router)
+app.include_router(acknowledge_router)
 app.include_router(ws_router)
+app.include_router(tts_router)
+app.include_router(chat_router)
 
 
 @app.exception_handler(Exception)

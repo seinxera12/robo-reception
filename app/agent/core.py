@@ -38,19 +38,67 @@ def _system_prompt(ctx) -> str:
     return build_system_prompt(ctx)
 
 
+# ── Tool call trace ────────────────────────────────────────────────────────
+
+def _log_tool_trace(result: object) -> None:
+    """
+    Walk the completed run's message history and emit one INFO line per tool
+    call and one per tool return. Payload is truncated to 120 chars so the
+    terminal stays readable.
+
+    Format:
+      ▶ tool call  : tool_name({"arg": "value"…})
+      ◀ tool return: tool_name → {"found": true, …}
+    """
+    try:
+        from pydantic_ai.messages import (
+            ModelResponse,
+            ModelRequest,
+            ToolCallPart,
+            ToolReturnPart,
+        )
+
+        pending: dict[str, str] = {}  # tool_call_id → tool_name
+
+        for msg in result.all_messages():  # type: ignore[union-attr]
+            if isinstance(msg, ModelResponse):
+                for part in msg.parts:
+                    if isinstance(part, ToolCallPart):
+                        # args_as_json_str() is the cleanest serialisation
+                        try:
+                            raw = part.args_as_json_str()
+                        except Exception:
+                            raw = str(part.args)
+                        snippet = raw[:120] + ("…" if len(raw) > 120 else "")
+                        pending[part.tool_call_id] = part.tool_name
+                        logger.info(f"  ▶ {part.tool_name}({snippet})")
+
+            elif isinstance(msg, ModelRequest):
+                for part in msg.parts:
+                    if isinstance(part, ToolReturnPart):
+                        name = pending.pop(part.tool_call_id, "?")
+                        ret = str(part.content)
+                        snippet = ret[:120] + ("…" if len(ret) > 120 else "")
+                        logger.info(f"  ◀ {name} → {snippet}")
+
+    except Exception as exc:
+        logger.debug(f"  tool trace unavailable: {exc}")
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 async def run_agent(
     utterance: str,
     deps: RoboDeps,
     conversation_history: list,
-) -> str:
+) -> tuple[str, object]:
     """
     Run the agent on a single user utterance.
-    Returns the response text to be passed to TTS.
+    Returns (response_text, result) — caller uses result.all_messages_json()
+    to persist conversation history.
     """
     t0 = time.time()
-    logger.info(f"Agent run: '{utterance[:80]}'")
+    logger.info(f"  ┌ user  : '{utterance[:120]}'")
 
     try:
         result = await agent.run(
@@ -60,25 +108,30 @@ async def run_agent(
         )
         elapsed = time.time() - t0
         response = result.output
-        logger.info(f"Agent response ({elapsed:.2f}s): '{response[:80]}'")
-        return response
+
+        # Emit per-tool ▶/◀ lines from the completed message history
+        _log_tool_trace(result)
+
+        logger.info(f"  └ robo  : '{response[:120]}' ({elapsed:.2f}s)")
+        return response, result
 
     except Exception as e:
-        logger.exception(f"Agent error: {e}")
-        return "I'm sorry, I ran into a problem. Could you please repeat that?"
+        elapsed = time.time() - t0
+        logger.error(f"  └ agent error ({elapsed:.2f}s): {e}")
+        logger.debug("  agent exception:", exc_info=True)
+        return "I'm sorry, I ran into a problem. Could you please repeat that?", None
 
 
 # ── Tool registration ──────────────────────────────────────────────────────
-# Tool modules are imported here, AFTER the agent is defined.
-# The @agent.tool decorators in each module register against this agent object.
+# Tool modules are imported AFTER the agent is defined.
+# The @agent.tool decorators register against this agent object.
 # Do NOT move these imports above the agent definition.
 
 def _register_tools() -> None:
-    import app.tools.appointments  # registers: lookup_appointment, check_availability
-    import app.tools.info          # registers: get_info
-    # Day 4: import app.tools.notifications  — notify_host, update_checkin_status
-    # Day 4: import app.tools.wayfinding     — get_directions
-    # Day 4: import app.tools.hosts          — list_hosts
+    import app.tools.appointments   # lookup_appointment, check_availability, update_checkin_status
+    import app.tools.info           # get_info
+    import app.tools.notifications  # notify_host
+    import app.tools.hosts          # list_hosts
 
 
 _register_tools()
