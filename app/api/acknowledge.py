@@ -14,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/acknowledge/{appointment_id}", response_class=HTMLResponse)
-async def acknowledge(appointment_id: str, request: Request):
+async def acknowledge(appointment_id: str, request: Request, session_uuid: str | None = None):
     """
     Host taps this link from the ntfy push notification.
     Sets notification_acknowledged = True and broadcasts a Redis event
@@ -52,6 +52,7 @@ async def acknowledge(appointment_id: str, request: Request):
             "appointment_id": appointment_id,
             "visitor_name": appt.visitor_name,
             "host_name": host.name,
+            "session_uuid": session_uuid,
         })
         receivers = await redis.publish("robo:events", event)
         logger.info(

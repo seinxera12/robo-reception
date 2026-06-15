@@ -2,13 +2,13 @@ import asyncio
 import json
 import logging
 import time
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 import redis.asyncio as aioredis
 
 from app.voice.vad import VADProcessor
 from app.voice.stt import transcribe
-from app.voice.tts import synthesise_stream
+from app.voice.tts import synthesise_stream, synthesise
 from app.session.manager import SessionManager
 from app.agent.core import run_agent
 from app.agent.models import RoboDeps
@@ -19,9 +19,17 @@ router = APIRouter()
 # Sentinel object: putting this into the send queue signals the writer to stop.
 _STOP = object()
 
+# How often (seconds) the pubsub poll loop yields without a message.
+# Keeps the event loop responsive without burning CPU.
+_PUBSUB_POLL_INTERVAL = 0.05
+
 
 @router.websocket("/ws/voice/{kiosk_id}")
-async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
+async def voice_endpoint(
+    websocket: WebSocket,
+    kiosk_id: str,
+    session_uuid: str | None = Query(default=None),
+):
     try:
         await websocket.accept()
         logger.info(f"✓ WebSocket connected: kiosk={kiosk_id} client={websocket.client}")
@@ -33,15 +41,10 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
     session_manager = SessionManager(redis)
 
     # ── Dedicated pubsub client ───────────────────────────────────────────────
-    # hiredis (installed via redis[hiredis]) has a known incompatibility with
-    # asyncio pubsub: its parser does not properly yield between listen() calls,
-    # causing published messages to be silently dropped. We use a separate client
-    # with the pure-Python RESP2 parser for the subscription connection only.
-    #
-    # socket_keepalive=True prevents the TCP connection from going silently stale
-    # when the host acknowledgement arrives minutes after the check-in; without it
-    # the OS/firewall can tear down the idle TCP connection and pubsub.listen()
-    # hangs forever, never receiving the event.
+    # hiredis has a known asyncio incompatibility (messages silently dropped).
+    # We use the pure-Python RESP2 parser for pubsub only.
+    # socket_keepalive=True prevents the OS from tearing down an idle TCP
+    # connection while waiting for the host to tap the acknowledge link.
     from app.config import settings as _settings
     from redis.asyncio.connection import _AsyncRESP2Parser
     _pubsub_redis = aioredis.from_url(
@@ -51,17 +54,29 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
         socket_keepalive=True,
     )
 
-    # ── [DIAG] Verify Redis connectivity at connection time ──────────────────
-    # Catches misconfiguration, wrong URL, or Redis being down before we
-    # invest in the full session/VAD setup.
     try:
         pong = await _pubsub_redis.ping()
         logger.info(f"  [DIAG] pubsub redis PING → {pong}  url={_settings.redis_url}")
     except Exception as _ping_err:
         logger.error(f"  [DIAG] pubsub redis PING FAILED: {_ping_err}  url={_settings.redis_url}")
 
+    # ── Session setup ─────────────────────────────────────────────────────────
     try:
-        session_uuid = await session_manager.create(kiosk_id)
+        if session_uuid:
+            existing = await session_manager.get(kiosk_id, session_uuid)
+            if existing is not None:
+                logger.info(
+                    f"  Voice: reusing existing session {session_uuid!r} "
+                    f"for kiosk={kiosk_id}"
+                )
+            else:
+                logger.warning(
+                    f"  Voice: session_uuid={session_uuid!r} not found "
+                    f"— creating new session"
+                )
+                session_uuid = await session_manager.create(kiosk_id)
+        else:
+            session_uuid = await session_manager.create(kiosk_id)
         logger.debug(f"  Session: {session_uuid}")
     except Exception as e:
         logger.exception(f"✗ Session creation failed: {e}")
@@ -71,13 +86,9 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
     vad = VADProcessor()
 
     # ── Serialised send queue ─────────────────────────────────────────────────
-    # Starlette WebSockets are NOT concurrent-send-safe. Both the audio loop and
-    # the Redis listener need to send frames, so we funnel everything through a
-    # single asyncio.Queue consumed by one dedicated writer coroutine.
-    # Items are either:
-    #   dict  → serialised to JSON text frame
-    #   bytes → sent as binary frame
-    #   _STOP → writer exits cleanly
+    # Starlette WebSockets are NOT concurrent-send-safe. All senders (audio loop
+    # and Redis listener) funnel through this queue → one writer task.
+    # Items: dict → JSON text frame | bytes → binary frame | _STOP → exit
     _send_queue: asyncio.Queue = asyncio.Queue()
 
     async def ws_writer():
@@ -93,8 +104,9 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 else:
                     text_frame = json.dumps(item)
                     await websocket.send_text(text_frame)
-                    # Only log non-audio control frames to avoid flooding
-                    if isinstance(item, dict) and item.get("type") in ("ui_update", "state", "transcript", "response"):
+                    if isinstance(item, dict) and item.get("type") in (
+                        "ui_update", "state", "transcript", "response", "tts_chunk_done"
+                    ):
                         logger.info(
                             f"  [DIAG] ws_writer: sent type={item.get('type')!r}"
                             + (f" event={item.get('event')!r}" if "event" in item else "")
@@ -102,7 +114,7 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                         )
             except Exception as e:
                 logger.error(
-                    f"  [DIAG] ws_writer: SEND FAILED — frame will NOT reach browser: {e}  "
+                    f"  [DIAG] ws_writer: SEND FAILED: {e}  "
                     f"item_type={type(item).__name__}"
                 )
 
@@ -114,13 +126,36 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
         """Non-blocking enqueue of a binary frame."""
         _send_queue.put_nowait(data)
 
+    async def speak(text: str) -> None:
+        """
+        Synthesise text and stream it through the send queue.
+        Safe to call from any coroutine — synthesis runs in a thread executor
+        so it never blocks the event loop.
+        """
+        logger.info(f"  [TTS] speak(): synthesising {len(text)} chars")
+        send_json({"type": "state", "state": "speaking"})
+        try:
+            audio_chunks = await asyncio.to_thread(synthesise, text)
+            for chunk in audio_chunks:
+                send_bytes(chunk)
+            send_json({"type": "audio_end"})
+            send_json({"type": "state", "state": "idle"})
+            logger.info("  [TTS] speak(): done")
+        except Exception as _tts_err:
+            logger.error(f"  [TTS] speak(): synthesis failed — {_tts_err}")
+            send_json({"type": "state", "state": "idle"})
+
     # ── Task 1: WebSocket writer ──────────────────────────────────────────────
     writer_task = asyncio.create_task(ws_writer())
 
     # ── Task 2: Redis pub/sub listener ────────────────────────────────────────
-    # _subscribed is set once the SUBSCRIBE confirmation arrives from Redis.
-    # audio_loop() awaits this event before proceeding — eliminating the race
-    # where agent tools publish events before the subscription is confirmed.
+    # WHY get_message() polling instead of `async for pubsub.listen()`:
+    # `listen()` holds an async socket-read inside the iterator between yields.
+    # When we `await run_in_executor(synthesise)` inside the loop body, the
+    # iterator's internal socket-read is still outstanding on the same connection
+    # and the two awaitables fight for the event loop — messages get dropped or
+    # the synthesise call never completes.  get_message() with a short timeout
+    # yields cleanly between polls and is the same pattern the SSE handler uses.
     _subscribed = asyncio.Event()
 
     async def redis_listener():
@@ -129,90 +164,117 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
         await pubsub.subscribe("robo:events")
 
         try:
-            async for message in pubsub.listen():
-                msg_type = message.get("type")
-
-                # The first message back from Redis is the subscribe confirmation
-                # (type == "subscribe").  Signal the audio loop that we're ready
-                # before doing anything else.
-                if msg_type == "subscribe":
+            # Drain the subscribe-confirmation frame first so _subscribed is set
+            # before audio_loop() starts sending audio.
+            while not _subscribed.is_set():
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=False, timeout=1.0
+                )
+                if msg and msg.get("type") == "subscribe":
                     _subscribed.set()
                     logger.info(
                         f"  [DIAG] pubsub: SUBSCRIBE confirmed "
-                        f"channel={message.get('channel')!r} "
-                        f"active_subs={message.get('data')}"
+                        f"channel={msg.get('channel')!r} "
+                        f"active_subs={msg.get('data')}"
                     )
+
+            # Main poll loop — yields every _PUBSUB_POLL_INTERVAL seconds
+            # whether or not a message arrived.
+            while True:
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=_PUBSUB_POLL_INTERVAL,
+                )
+
+                if msg is None:
+                    continue  # no message this tick — yield and poll again
+
+                if msg.get("type") != "message":
+                    logger.debug(f"  [DIAG] pubsub: ignored frame type={msg.get('type')!r}")
                     continue
 
-                # pong frames arrive if health-check PINGs are sent on the
-                # pubsub connection — not messages, just keepalive traffic.
-                if msg_type == "pong":
-                    logger.debug("  [DIAG] pubsub: keepalive pong received")
-                    continue
-
-                if msg_type != "message":
-                    logger.debug(f"  [DIAG] pubsub: ignored frame type={msg_type!r}")
-                    continue
-
-                # ── Real event payload ────────────────────────────────────
-                raw = message.get("data", "")
+                raw = msg.get("data", "")
                 logger.info(
-                    f"  [DIAG] pubsub: MESSAGE received "
-                    f"channel={message.get('channel')!r} raw={raw[:120]!r}"
+                    f"  [DIAG] pubsub: MESSAGE received raw={raw[:120]!r}"
                 )
 
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError as _je:
-                    logger.error(f"  [DIAG] pubsub: JSON decode failed: {_je}  raw={raw!r}")
+                    logger.error(f"  [DIAG] pubsub: JSON decode failed: {_je}")
                     continue
 
                 event_type = event.get("type", "<missing>")
-                logger.info(f"  [DIAG] pubsub: dispatching event_type={event_type!r}")
+                event_session = event.get("session_uuid")
 
+                logger.info(
+                    f"  [DIAG] pubsub: dispatching event_type={event_type!r} "
+                    f"event_session={event_session!r} our_session={session_uuid!r}"
+                )
+
+                # ── host_acknowledged ─────────────────────────────────────
                 if event_type == "host_acknowledged":
-                    payload = {
+                    # Only announce for our session — multiple kiosks may be
+                    # subscribed to the same channel.
+                    if event_session and event_session != session_uuid:
+                        logger.debug(
+                            f"  [DIAG] pubsub: host_acknowledged skipped "
+                            f"(session mismatch)"
+                        )
+                        continue
+
+                    host_name     = event["host_name"]
+                    visitor_name  = event["visitor_name"]
+                    announce_text = f"{host_name} is on their way to meet you."
+
+                    send_json({
                         "type": "ui_update",
                         "event": "host_acknowledged",
-                        "host_name": event["host_name"],
-                        "visitor_name": event["visitor_name"],
+                        "host_name": host_name,
+                        "visitor_name": visitor_name,
                         "appointment_id": event["appointment_id"],
-                    }
-                    send_json(payload)
+                    })
                     logger.info(
                         f"  [DIAG] ui_update enqueued: host_acknowledged "
-                        f"visitor={event.get('visitor_name')!r} "
-                        f"queue_size={_send_queue.qsize()}"
+                        f"visitor={visitor_name!r}"
                     )
 
+                    # Speak the announcement — runs synthesis in a thread,
+                    # streams audio chunks through the send queue.
+                    await speak(announce_text)
+
+                # ── checkin_complete ──────────────────────────────────────
                 elif event_type == "checkin_complete":
-                    payload = {
+                    if event_session and event_session != session_uuid:
+                        continue
+                    send_json({
                         "type": "ui_update",
                         "event": "checkin_complete",
                         "appointment_id": event["appointment_id"],
-                    }
-                    send_json(payload)
+                    })
                     logger.info(
-                        f"  [DIAG] ui_update enqueued: checkin_complete "
-                        f"queue_size={_send_queue.qsize()}"
+                        f"  [DIAG] ui_update enqueued: checkin_complete"
                     )
 
+                # ── notification_sent ─────────────────────────────────────
                 elif event_type == "notification_sent":
-                    payload = {
+                    if event_session and event_session != session_uuid:
+                        continue
+                    send_json({
                         "type": "ui_update",
                         "event": "notification_sent",
                         "appointment_id": event["appointment_id"],
                         "host_name": event["host_name"],
-                    }
-                    send_json(payload)
+                    })
                     logger.info(
                         f"  [DIAG] ui_update enqueued: notification_sent "
-                        f"host={event.get('host_name')!r} "
-                        f"queue_size={_send_queue.qsize()}"
+                        f"host={event.get('host_name')!r}"
                     )
 
                 else:
-                    logger.warning(f"  [DIAG] pubsub: unhandled event_type={event_type!r}")
+                    logger.warning(
+                        f"  [DIAG] pubsub: unhandled event_type={event_type!r}"
+                    )
 
         except asyncio.CancelledError:
             logger.info("  [DIAG] pubsub: listener task cancelled — cleaning up")
@@ -222,19 +284,14 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
             logger.info("  Redis pub/sub unsubscribed")
             raise
         except Exception as _listener_err:
-            # Any unexpected exception here means the listener is dead — log it
-            # loudly so it's visible even if the audio loop is still running.
             logger.exception(
-                f"  [DIAG] pubsub: listener crashed — events will no longer reach browser: {_listener_err}"
+                f"  [DIAG] pubsub: listener crashed — events will no longer "
+                f"reach browser: {_listener_err}"
             )
             raise
 
     # ── Task 3: Audio receive + agent loop ────────────────────────────────────
     async def audio_loop():
-        # Wait for the Redis subscription to be confirmed before proceeding.
-        # This closes the race where agent tools publish events before the
-        # listener has finished the SUBSCRIBE handshake with Redis, which
-        # causes those events to be silently dropped.
         logger.info("  [DIAG] audio_loop: waiting for pubsub subscription confirmation…")
         try:
             await asyncio.wait_for(_subscribed.wait(), timeout=5.0)
@@ -244,8 +301,6 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 "  [DIAG] audio_loop: TIMEOUT waiting for pubsub SUBSCRIBE confirmation "
                 "(>5s) — Redis may be unreachable or the listener task crashed"
             )
-            # Don't abort — continue anyway so the kiosk isn't bricked,
-            # but badge updates will not work until this is resolved.
 
         send_json({"type": "state", "state": "idle"})
         logger.info("  Voice loop started")
@@ -260,9 +315,11 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 if _chunk_count == 1:
                     logger.info(f"  ← First PCM chunk received: {len(message)} bytes")
                 elif _chunk_count % 200 == 0:
-                    logger.info(f"  ← PCM chunks received: {_chunk_count}, last chunk: {len(message)} bytes")
+                    logger.info(
+                        f"  ← PCM chunks received: {_chunk_count}, "
+                        f"last chunk: {len(message)} bytes"
+                    )
 
-                # ── VAD ───────────────────────────────────────────────────
                 is_speaking, utterance_bytes = vad.process_chunk(message)
 
                 if is_speaking and not _speaking_logged:
@@ -272,16 +329,14 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 elif is_speaking:
                     send_json({"type": "state", "state": "listening"})
                 elif not is_speaking and _speaking_logged:
-                    pass  # speech ended but utterance not yet complete
+                    pass
 
                 if utterance_bytes is None:
                     continue
 
-                # Utterance complete
                 _speaking_logged = False
                 logger.info(f"  VAD: utterance complete — {len(utterance_bytes)} bytes")
 
-                # ── STT ───────────────────────────────────────────────────
                 send_json({"type": "state", "state": "thinking"})
 
                 t_utterance_end = time.time()
@@ -296,7 +351,6 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 logger.info(f"  STT ({t_stt_done - t_utterance_end:.2f}s): '{transcript}'")
                 send_json({"type": "transcript", "text": transcript})
 
-                # ── Agent ─────────────────────────────────────────────────
                 session_data = await session_manager.get(kiosk_id, session_uuid) or {}
 
                 deps = RoboDeps(
@@ -304,7 +358,9 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                     session_uuid=session_uuid,
                     visitor_name=session_data.get("visitor_name"),
                     current_appointment_id=session_data.get("current_appointment_id"),
-                    redis=redis,  # tools use this to publish badge events
+                    host_id=session_data.get("host_id"),
+                    checkin_stage=session_data.get("checkin_stage", "idle"),
+                    redis=redis,
                 )
                 conversation_history_raw = session_data.get("conversation_history", "[]")
                 if isinstance(conversation_history_raw, str) and conversation_history_raw:
@@ -314,10 +370,11 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 else:
                     conversation_history = []
 
-                response_text, agent_result = await run_agent(transcript, deps, conversation_history)
+                response_text, agent_result = await run_agent(
+                    transcript, deps, conversation_history
+                )
                 t_agent_done = time.time()
 
-                # Persist conversation history
                 history_json: str = (
                     agent_result.all_messages_json().decode("utf-8")
                     if agent_result else "[]"
@@ -326,9 +383,7 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                     "conversation_history": history_json,
                 })
 
-                # ── TTS (streaming) ───────────────────────────────────────
                 send_json({"type": "response", "text": response_text})
-                send_json({"type": "state", "state": "speaking"})
 
                 first_chunk = True
                 async for audio_chunk in synthesise_stream(response_text):
@@ -352,10 +407,10 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
                 send_json({"type": "state", "state": "idle"})
 
     # ── Run all tasks concurrently ────────────────────────────────────────────
-    # Start the listener first so its subscribe handshake is in-flight while
-    # audio_loop() awaits _subscribed.  This guarantees no events are lost.
     listener_task = asyncio.create_task(redis_listener())
-    logger.info(f"  [DIAG] tasks created: writer={writer_task!r} listener={listener_task!r}")
+    logger.info(
+        f"  [DIAG] tasks created: writer={writer_task!r} listener={listener_task!r}"
+    )
     try:
         await audio_loop()
     except WebSocketDisconnect:
@@ -363,11 +418,6 @@ async def voice_endpoint(websocket: WebSocket, kiosk_id: str):
     except Exception as e:
         logger.exception(f"✗ WebSocket error: {e}")
     finally:
-        # Stop the writer and listener cleanly
         listener_task.cancel()
         _send_queue.put_nowait(_STOP)
         await asyncio.gather(writer_task, listener_task, return_exceptions=True)
-        try:
-            await session_manager.delete(kiosk_id, session_uuid)
-        except Exception:
-            pass

@@ -10,8 +10,30 @@ from app.agent.core import agent
 from app.agent.models import RoboDeps, AppointmentMatch, AvailabilityResult, AvailabilitySlot
 from app.db.models import Appointment, Host, AppointmentStatus
 from app.db.session import AsyncSessionLocal
+from app.session.manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+async def _persist_deps(ctx: RunContext[RoboDeps]) -> None:
+    """
+    Write the mutable fields of ctx.deps back to Redis so the next turn
+    picks up the updated stage, visitor_name, and appointment/host IDs.
+    """
+    if ctx.deps.redis is None:
+        return
+    sm = SessionManager(ctx.deps.redis)
+    try:
+        await sm.update(ctx.deps.kiosk_id, ctx.deps.session_uuid, {
+            "visitor_name": ctx.deps.visitor_name,
+            "current_appointment_id": ctx.deps.current_appointment_id,
+            "host_id": ctx.deps.host_id,
+            "checkin_stage": ctx.deps.checkin_stage,
+        })
+    except Exception as exc:
+        logger.warning(f"  _persist_deps: failed to write stage — {exc}")
 
 
 # ── Tool 1: lookup_appointment ─────────────────────────────────────────────
@@ -43,7 +65,14 @@ async def lookup_appointment(
             row = result.first()
             if row:
                 appt, host = row
-                return _appointment_to_match(appt, host, confidence=1.0)
+                match = _appointment_to_match(appt, host, confidence=1.0)
+                # Advance stage so the prompt asks for confirmation next
+                ctx.deps.visitor_name = appt.visitor_name
+                ctx.deps.current_appointment_id = str(appt.id)
+                ctx.deps.host_id = str(appt.host_id)
+                ctx.deps.checkin_stage = "appointment_found"
+                await _persist_deps(ctx)
+                return match
             return AppointmentMatch(
                 found=False,
                 message=f"No scheduled appointment found with code '{appointment_code}'."
@@ -94,6 +123,12 @@ async def lookup_appointment(
                 f"  lookup: matched '{best.visitor_name}' "
                 f"conf={confidence:.2f} host={best.host_name} room={best.room}"
             )
+            # Advance stage so the prompt knows to ask for confirmation next
+            ctx.deps.visitor_name = best.visitor_name
+            ctx.deps.current_appointment_id = str(best.id)
+            ctx.deps.host_id = str(best.host_id)
+            ctx.deps.checkin_stage = "appointment_found"
+            await _persist_deps(ctx)
             return AppointmentMatch(
                 found=True,
                 appointment_id=str(best.id),
@@ -200,7 +235,40 @@ async def check_availability(
         )
 
 
-# ── Tool 3: update_checkin_status ─────────────────────────────────────────
+# ── Tool 3: confirm_appointment ────────────────────────────────────────────
+
+class ConfirmResult(BaseModel):
+    confirmed: bool
+    appointment_id: str | None = None
+    message: str = ""
+
+
+@agent.tool
+async def confirm_appointment(
+    ctx: RunContext[RoboDeps],
+    appointment_id: str,
+) -> ConfirmResult:
+    """
+    Record that the visitor has verbally confirmed their appointment details.
+    Call this ONLY after presenting the appointment details and the visitor
+    says "yes", "correct", "that's me", or similar affirmation.
+    Do NOT call this speculatively — wait for the visitor's confirmation.
+    After this returns confirmed=true, ask the visitor if they'd like to check in.
+    """
+    logger.info(f"Tool: confirm_appointment(appointment_id={appointment_id})")
+
+    ctx.deps.checkin_stage = "confirmed"
+    await _persist_deps(ctx)
+
+    logger.info(f"  confirm: ✓ appointment {appointment_id[:8]}… → confirmed")
+    return ConfirmResult(
+        confirmed=True,
+        appointment_id=appointment_id,
+        message="Appointment confirmed by visitor.",
+    )
+
+
+# ── Tool 4: update_checkin_status ─────────────────────────────────────────
 
 class CheckinResult(BaseModel):
     success: bool
@@ -245,11 +313,16 @@ async def update_checkin_status(
 
         logger.info(f"  checkin: ✓ appointment {appointment_id[:8]}… → checked_in")
 
+        # Advance stage so the prompt asks for host notification permission next
+        ctx.deps.checkin_stage = "checked_in"
+        await _persist_deps(ctx)
+
         # Publish event so the WebSocket listener can update the browser badge
         if ctx.deps.redis is not None:
             _payload = json.dumps({
                 "type": "checkin_complete",
                 "appointment_id": appointment_id,
+                "session_uuid": ctx.deps.session_uuid,
             })
             _receivers = await ctx.deps.redis.publish("robo:events", _payload)
             logger.info(
