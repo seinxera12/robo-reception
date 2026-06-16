@@ -111,10 +111,56 @@ def _split_sentences(text: str) -> list[str]:
     return sentences if sentences else [text]
 
 
+def _synthesise_one(sentence: str) -> bytes | None:
+    """
+    Synthesise a single sentence in a thread-safe, blocking call.
+    Returns raw Int16 PCM bytes, or None if synthesis produced no audio.
+    """
+    if _pipeline is None:
+        raise RuntimeError("TTS model not loaded — call load_tts_model() first")
+
+    audio_chunks = list(_pipeline(sentence, voice=VOICE))
+    if not audio_chunks:
+        return None
+
+    audio_arrays = [c[2] for c in audio_chunks if c[2] is not None]
+    if not audio_arrays:
+        return None
+
+    audio = np.concatenate(audio_arrays)
+    return (audio * 32767).astype(np.int16).tobytes()
+
+
 def synthesise(text: str) -> list[bytes]:
     """
-    Synchronous version — synthesise full response, return list of Int16 PCM chunks.
-    Called via asyncio.to_thread() from the WebSocket handler.
+    Synchronous bulk version — synthesise full response, return list of Int16 PCM chunks.
+    Kept for backward compatibility; the streaming hot path uses synthesise_stream().
+    """
+    sentences = _split_sentences(text)
+    logger.info(f"TTS: {len(sentences)} sentence(s), {len(text)} chars")
+
+    result = []
+    for i, sentence in enumerate(sentences, 1):
+        t0 = time.time()
+        pcm = _synthesise_one(sentence)
+        if pcm:
+            result.append(pcm)
+            logger.debug(f"TTS: sentence {i}/{len(sentences)} ({time.time()-t0:.2f}s) → {len(pcm)} bytes")
+
+    return result
+
+
+async def synthesise_stream(text: str) -> AsyncIterator[bytes]:
+    """
+    TRUE sentence-streaming async generator.
+
+    Splits the response into sentences and synthesises each one in a thread
+    executor, yielding PCM bytes as soon as each sentence is ready.  This
+    means the first audio chunk arrives after ~1-2s (one sentence) rather
+    than waiting for all sentences to finish (~9s for 4 sentences).
+
+    The caller (WebSocket handler) can start sending audio to the client
+    immediately while the remaining sentences are still being synthesised.
     """
     if _pipeline is None:
         raise RuntimeError("TTS model not loaded — call load_tts_model() first")
@@ -122,33 +168,16 @@ def synthesise(text: str) -> list[bytes]:
     sentences = _split_sentences(text)
     logger.info(f"TTS: {len(sentences)} sentence(s), {len(text)} chars")
 
-    result = []
+    loop = asyncio.get_event_loop()
     for i, sentence in enumerate(sentences, 1):
-        import time as _time
-        t0 = _time.time()
-
-        audio_chunks = list(_pipeline(sentence, voice=VOICE))
-        if not audio_chunks:
-            continue
-
-        audio_arrays = [c[2] for c in audio_chunks if c[2] is not None]
-        if not audio_arrays:
-            continue
-
-        audio = np.concatenate(audio_arrays)
-        pcm_bytes = (audio * 32767).astype(np.int16).tobytes()
-        result.append(pcm_bytes)
-
-        logger.debug(f"TTS: sentence {i}/{len(sentences)} ({_time.time()-t0:.2f}s) → {len(pcm_bytes)} bytes")
-
-    return result
-
-
-async def synthesise_stream(text: str) -> AsyncIterator[bytes]:
-    """
-    Async generator wrapper — yields chunks one at a time.
-    Note: each yield still blocks briefly; prefer synthesise() + to_thread for WebSocket use.
-    """
-    chunks = await asyncio.get_event_loop().run_in_executor(None, synthesise, text)
-    for chunk in chunks:
-        yield chunk
+        t0 = time.time()
+        pcm = await loop.run_in_executor(None, _synthesise_one, sentence)
+        elapsed = time.time() - t0
+        if pcm:
+            logger.debug(
+                f"TTS: sentence {i}/{len(sentences)} ({elapsed:.2f}s) "
+                f"→ {len(pcm)} bytes — yielding"
+            )
+            yield pcm
+        else:
+            logger.warning(f"TTS: sentence {i}/{len(sentences)} produced no audio — skipping")

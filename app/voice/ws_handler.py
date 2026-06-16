@@ -8,7 +8,7 @@ import redis.asyncio as aioredis
 
 from app.voice.vad import VADProcessor
 from app.voice.stt import transcribe
-from app.voice.tts import synthesise_stream, synthesise
+from app.voice.tts import synthesise_stream
 from app.session.manager import SessionManager
 from app.agent.core import run_agent
 from app.agent.models import RoboDeps
@@ -128,15 +128,13 @@ async def voice_endpoint(
 
     async def speak(text: str) -> None:
         """
-        Synthesise text and stream it through the send queue.
-        Safe to call from any coroutine — synthesis runs in a thread executor
-        so it never blocks the event loop.
+        Synthesise text sentence-by-sentence and stream audio through the send queue.
+        Uses synthesise_stream() so the first sentence is audible in ~1-2s.
         """
         logger.info(f"  [TTS] speak(): synthesising {len(text)} chars")
         send_json({"type": "state", "state": "speaking"})
         try:
-            audio_chunks = await asyncio.to_thread(synthesise, text)
-            for chunk in audio_chunks:
+            async for chunk in synthesise_stream(text):
                 send_bytes(chunk)
             send_json({"type": "audio_end"})
             send_json({"type": "state", "state": "idle"})
